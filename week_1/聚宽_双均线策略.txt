@@ -1,0 +1,167 @@
+# 聚宽双均线策略 - 直接复制到聚宽平台使用
+# 网站：https://www.joinquant.com/
+# 路径：我的策略 -> 新建策略 -> 粘贴此代码
+
+# ==================== 初始化函数 ====================
+def initialize(context):
+    """
+    初始化函数，策略开始运行时执行一次
+    """
+    # 设置基准（用来对比策略表现）
+    set_benchmark('000300.XSHG')  # 沪深300指数
+    
+    # 设置交易成本
+    set_order_cost(OrderCost(
+        open_tax=0,                 # 买入印花税（股票买入不收印花税）
+        close_tax=0.001,            # 卖出印花税（千分之一）
+        open_commission=0.0003,     # 买入佣金（万分之三）
+        close_commission=0.0003,    # 卖出佣金（万分之三）
+        close_today_commission=0,   # 平今佣金
+        min_commission=5            # 最低佣金5元
+    ), type='stock')
+    
+    # 设置滑点（模拟真实交易的成交价格偏差）
+    set_slippage(FixedSlippage(0.002))  # 固定滑点0.2%
+    
+    # 设置参数（可修改的部分）
+    g.security = '000001.XSHE'   # 股票代码：平安银行
+    g.short_window = 5           # 短期均线：5日
+    g.long_window = 20           # 长期均线：20日
+    
+    # 设置定时运行
+    run_daily(before_market_open, time='before_open')  # 每天开盘前
+    run_daily(market_open, time='open')                 # 每天开盘时
+    run_daily(after_market_close, time='after_close')   # 每天收盘后
+
+
+# ==================== 开盘前运行 ====================
+def before_market_open(context):
+    """
+    每天开盘前运行：计算交易信号
+    """
+    # 获取历史数据（多取10天，避免均线计算时数据不足）
+    hist = attribute_history(
+        g.security,                       # 股票代码
+        g.long_window + 10,               # 取多少天的数据
+        '1d',                             # 日线数据
+        ['close'],                        # 只需要收盘价
+        skip_paused=True,                 # 跳过停牌日
+        df=False                          # 返回字典格式，速度更快
+    )
+    
+    # 计算均线
+    close_prices = hist['close']
+    short_ma = close_prices[-g.short_window:].mean()   # 最近5天均值
+    long_ma = close_prices[-g.long_window:].mean()     # 最近20天均值
+    
+    # 计算昨天的均线（用于判断交叉）
+    short_ma_yesterday = close_prices[-g.short_window-1:-1].mean()
+    long_ma_yesterday = close_prices[-g.long_window-1:-1].mean()
+    
+    # 判断信号
+    # 金叉：短期均线上穿长期均线
+    g.golden_cross = (short_ma > long_ma) and (short_ma_yesterday <= long_ma_yesterday)
+    
+    # 死叉：短期均线下穿长期均线
+    g.dead_cross = (short_ma < long_ma) and (short_ma_yesterday >= long_ma_yesterday)
+    
+    # 记录日志
+    log.info(f"【开盘前】MA{g.short_window}={short_ma:.2f}, MA{g.long_window}={long_ma:.2f}")
+    
+    if g.golden_cross:
+        log.info("【信号】金叉出现，准备买入")
+    elif g.dead_cross:
+        log.info("【信号】死叉出现，准备卖出")
+
+
+# ==================== 开盘时运行 ====================
+def market_open(context):
+    """
+    每天开盘时运行：执行交易
+    """
+    security = g.security
+    
+    # 检查股票是否停牌
+    current_data = get_current_data()[security]
+    if current_data.paused:
+        log.info("【跳过】股票停牌")
+        return
+    
+    # 获取当前价格
+    current_price = current_data.day_open
+    
+    # 获取当前持仓
+    holding = context.portfolio.positions.get(security)
+    holding_amount = holding.total_amount if holding else 0
+    
+    # ===== 交易逻辑 =====
+    
+    # 情况1：金叉且未持仓 -> 买入
+    if g.golden_cross and holding_amount == 0:
+        # 计算买入金额（全仓的90%，留10%应对波动）
+        cash = context.portfolio.available_cash
+        buy_value = cash * 0.9
+        
+        # 下单
+        order_value(security, buy_value)
+        log.info(f"【买入】{security} 金额{buy_value:.0f}元 @ 价格{current_price:.2f}")
+    
+    # 情况2：死叉且已持仓 -> 卖出
+    elif g.dead_cross and holding_amount > 0:
+        # 清仓
+        order_target(security, 0)
+        log.info(f"【卖出】{security} {holding_amount}股 @ 价格{current_price:.2f}")
+    
+    else:
+        log.info("【持仓不动】")
+
+
+# ==================== 收盘后运行 ====================
+def after_market_close(context):
+    """
+    每天收盘后运行：记录账户信息
+    """
+    # 获取账户信息
+    total_value = context.portfolio.total_value       # 总资产
+    positions_value = context.portfolio.positions_value  # 持仓市值
+    available_cash = context.portfolio.available_cash    # 可用现金
+    
+    # 获取今日收益率
+    returns = context.portfolio.returns
+    
+    # 记录日志
+    log.info('========================================')
+    log.info(f'【收盘总结】日期: {context.current_dt.strftime("%Y-%m-%d")}')
+    log.info(f'总资产: {total_value:.2f}')
+    log.info(f'持仓市值: {positions_value:.2f}')
+    log.info(f'可用现金: {available_cash:.2f}')
+    log.info(f'今日收益: {returns*100:.2f}%')
+    log.info('========================================')
+
+
+# ==================== 策略说明 ====================
+"""
+【策略名称】双均线策略（入门版）
+
+【策略逻辑】
+1. 计算5日均线（MA5）和20日均线（MA20）
+2. 当MA5上穿MA20（金叉）时，买入股票
+3. 当MA5下穿MA20（死叉）时，卖出股票
+4. 买入时使用90%仓位，保留10%现金
+
+【可修改的参数】
+- g.security: 股票代码（如'600519.XSHG'是茅台）
+- g.short_window: 短期均线周期（默认5日）
+- g.long_window: 长期均线周期（默认20日）
+- buy_value中的0.9: 仓位比例（0.9=90%仓位）
+
+【回测建议设置】
+- 时间范围：2024-01-01 至 2024-12-31
+- 初始资金：100000（10万元）
+- 回测频率：每天
+- Benchmark：000300.XSHG（沪深300）
+
+【风险提示】
+本策略仅供学习参考，不构成投资建议
+过往业绩不代表未来表现
+"""
